@@ -1,0 +1,449 @@
+version: '3.8'
+
+# Milvus Distributed Mode with Kafka
+# For DetectionSuite - Production-Ready Setup
+# 
+# Architecture:
+# - Kafka: Message queue for automatic catch-up
+# - etcd: Metadata storage
+# - MinIO: Object storage for vectors
+# - 4 Coordinators: RootCoord, QueryCoord, DataCoord, IndexCoord
+# - 3 Worker types: Proxy, QueryNode, DataNode, IndexNode
+#
+# Features:
+# ✅ Automatic catch-up when nodes recover
+# ✅ Horizontal scaling
+# ✅ Fault tolerance
+# ✅ No manual sync needed!
+
+services:
+  # ==================== MESSAGE QUEUE (Kafka) ====================
+  
+  zookeeper:
+    container_name: milvus-zookeeper
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+      ZOOKEEPER_SYNC_LIMIT: 5
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo ruok | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - milvus
+
+  kafka:
+    container_name: milvus-kafka
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"  # External access
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168  # 7 days
+      KAFKA_LOG_SEGMENT_BYTES: 1073741824  # 1GB segments
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_DELETE_TOPIC_ENABLE: 'true'
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - milvus
+
+  # ==================== METADATA STORAGE (etcd) ====================
+  
+  etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.5.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - milvus
+
+  # ==================== OBJECT STORAGE (MinIO) ====================
+  
+  minio:
+    container_name: milvus-minio
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"  # Console UI
+    volumes:
+      - minio_data:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - milvus
+
+  # ==================== COORDINATORS ====================
+  
+  rootcoord:
+    container_name: milvus-rootcoord
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "rootcoord"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""  # Disable Pulsar
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_rootcoord:/var/lib/milvus
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - milvus
+
+  datacoord:
+    container_name: milvus-datacoord
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "datacoord"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_datacoord:/var/lib/milvus
+    depends_on:
+      rootcoord:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - milvus
+
+  querycoord:
+    container_name: milvus-querycoord
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "querycoord"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_querycoord:/var/lib/milvus
+    depends_on:
+      rootcoord:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - milvus
+
+  indexcoord:
+    container_name: milvus-indexcoord
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "indexcoord"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_indexcoord:/var/lib/milvus
+    depends_on:
+      rootcoord:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - milvus
+
+  # ==================== PROXY (Entry Point) ====================
+  
+  proxy:
+    container_name: milvus-proxy
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "proxy"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    ports:
+      - "19530:19530"  # gRPC (your client connects here!)
+      - "9091:9091"    # HTTP/Metrics
+    depends_on:
+      rootcoord:
+        condition: service_healthy
+      querycoord:
+        condition: service_healthy
+      datacoord:
+        condition: service_healthy
+      indexcoord:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - milvus
+
+  # ==================== WORKERS ====================
+  
+  # Query Nodes - Execute search queries
+  # Scale these for read performance!
+  querynode1:
+    container_name: milvus-querynode1
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "querynode"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_querynode1:/var/lib/milvus
+    depends_on:
+      querycoord:
+        condition: service_healthy
+    networks:
+      - milvus
+
+  querynode2:
+    container_name: milvus-querynode2
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "querynode"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_querynode2:/var/lib/milvus
+    depends_on:
+      querycoord:
+        condition: service_healthy
+    networks:
+      - milvus
+
+  # Data Nodes - Handle data ingestion
+  # Scale these for write performance!
+  datanode1:
+    container_name: milvus-datanode1
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "datanode"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_datanode1:/var/lib/milvus
+    depends_on:
+      datacoord:
+        condition: service_healthy
+    networks:
+      - milvus
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    cpuset: "1"
+
+  datanode2:
+    container_name: milvus-datanode2
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "datanode"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_datanode2:/var/lib/milvus
+    depends_on:
+      datacoord:
+        condition: service_healthy
+    networks:
+      - milvus
+
+  # Index Nodes - Build vector indexes
+  # Scale these if index building is slow!
+  indexnode1:
+    container_name: milvus-indexnode1
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "indexnode"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_indexnode1:/var/lib/milvus
+    depends_on:
+      indexcoord:
+        condition: service_healthy
+    networks:
+      - milvus
+
+  indexnode2:
+    container_name: milvus-indexnode2
+    image: milvusdb/milvus:v2.3.2
+    command: ["milvus", "run", "indexnode"]
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      PULSAR_ADDRESS: ""
+      KAFKA_BROKER_LIST: kafka:9092
+      COMMON_STORAGETYPE: minio
+    env_file:
+      - milvus-distributed.env
+    volumes:
+      - milvus_indexnode2:/var/lib/milvus
+    depends_on:
+      indexcoord:
+        condition: service_healthy
+    networks:
+      - milvus
+
+  # ==================== MONITORING (Optional but Recommended) ====================
+  
+  # Attu - Milvus Web UI
+  attu:
+    container_name: milvus-attu
+    image: zilliz/attu:v2.3
+    ports:
+      - "8000:3000"
+    environment:
+      MILVUS_URL: milvus-proxy:19530
+    depends_on:
+      proxy:
+        condition: service_healthy
+    networks:
+      - milvus
+
+volumes:
+  zookeeper_data:
+    driver: local
+  zookeeper_log:
+    driver: local
+  kafka_data:
+    driver: local
+  etcd_data:
+    driver: local
+  minio_data:
+    driver: local
+  milvus_rootcoord:
+    driver: local
+  milvus_datacoord:
+    driver: local
+  milvus_querycoord:
+    driver: local
+  milvus_indexcoord:
+    driver: local
+  milvus_querynode1:
+    driver: local
+  milvus_querynode2:
+    driver: local
+  milvus_datanode1:
+    driver: local
+  milvus_datanode2:
+    driver: local
+  milvus_indexnode1:
+    driver: local
+  milvus_indexnode2:
+    driver: local
+
+networks:
+  milvus:
+    driver: bridge
+    name: milvus_network
+
