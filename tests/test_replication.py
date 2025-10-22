@@ -15,6 +15,7 @@ import time
 import logging
 from typing import List, Dict, Optional
 from pymilvus import MilvusClient, DataType
+from database_utils import DatabaseManager
 
 # Simple logging setup
 logging.basicConfig(
@@ -39,137 +40,39 @@ class MilvusDistributedManagerV2:
     def __init__(self, uri: str = MILVUS_URI):
         """Initialize with database-level replicas"""
         self.uri = uri
-        self.client = None
-        self._connect()
-        self._ensure_database()
+        # Ensure Docker containers are running before starting tests
+        self.db_manager = DatabaseManager(uri, DATABASE_NAME, ensure_docker_running=True)
         self._ensure_collection()
         logger.info(f"✅ Connected to Milvus with DATABASE-LEVEL REPLICA=2")
     
-    def _connect(self):
-        """Connect to Milvus"""
-        try:
-            self.client = MilvusClient(uri=self.uri)
-            logger.info(f"Connected to Milvus at {self.uri}")
-        except Exception as e:
-            logger.error(f"Failed to connect: {e}")
-            raise
-    
-    def _ensure_database(self):
-        """Create database with REPLICA=2 as default"""
-        try:
-            # List databases
-            databases = self.client.list_databases()
-            logger.info(f"Existing databases: {databases}")
-            
-            if DATABASE_NAME not in databases:
-                logger.info(f"Creating database '{DATABASE_NAME}' with REPLICA=2...")
-                
-                # Create database with replica configuration
-                self.client.create_database(
-                    db_name=DATABASE_NAME,
-                    properties={
-                        "database.replica.number": "2"  # ← Default REPLICA=2 for all collections!
-                    }
-                )
-                
-                logger.info(f"✅ Database '{DATABASE_NAME}' created with default REPLICA=2")
-            else:
-                logger.info(f"Database '{DATABASE_NAME}' already exists")
-            
-            # Switch to this database
-            self.client.using_database(DATABASE_NAME)
-            logger.info(f"✅ Using database: {DATABASE_NAME}")
-            
-        except Exception as e:
-            logger.warning(f"Database creation failed (may not be supported): {e}")
-            logger.info("Falling back to default database with collection-level replicas")
     
     def _ensure_collection(self):
         """Create collection (will automatically use REPLICA=2 from database!)"""
         try:
-            if self.client.has_collection(COLLECTION_NAME):
-                logger.info(f"Collection '{COLLECTION_NAME}' already exists")
-                
-                # Load collection (should inherit REPLICA=2 from database)
-                self.client.load_collection(COLLECTION_NAME)
-                return
-            
-            # Create collection
-            logger.info(f"Creating collection '{COLLECTION_NAME}'...")
-            
-            schema = self.client.create_schema(
-                auto_id=False,
-                enable_dynamic_field=True
-            )
-            
-            schema.add_field("detection_uuid", DataType.VARCHAR, max_length=100, is_primary=True)
-            schema.add_field("reid_matrix", DataType.FLOAT_VECTOR, dim=REID_DIM)
-            schema.add_field("reid", DataType.INT64)
-            schema.add_field("source_id", DataType.VARCHAR, max_length=50)
-            schema.add_field("timestamp", DataType.DOUBLE)
-            
-            index_params = self.client.prepare_index_params()
-            index_params.add_index(
-                field_name="reid_matrix",
-                index_type="IVF_FLAT",
-                metric_type="L2",
-                params={"nlist": 1024}
-            )
-            
-            self.client.create_collection(
-                collection_name=COLLECTION_NAME,
-                schema=schema,
-                index_params=index_params
-            )
-            
-            # Load collection (inherits REPLICA=2 from database!)
-            self.client.load_collection(COLLECTION_NAME)
-            
-            logger.info(f"✅ Created collection (will inherit REPLICA=2 from database)")
-            
+            success = self.db_manager.create_reid_collection(COLLECTION_NAME)
+            if success:
+                logger.info(f"✅ Created collection (will inherit REPLICA=2 from database)")
+            else:
+                logger.error("Failed to create collection")
+                raise Exception("Collection creation failed")
         except Exception as e:
             logger.error(f"Error: {e}")
             raise
     
     def insert_reid(self, data: List[Dict]) -> bool:
         """Insert ReID data"""
-        if not data:
-            return True
-        try:
-            self.client.insert(collection_name=COLLECTION_NAME, data=data)
-            logger.debug(f"✅ Inserted {len(data)} records")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Insert failed: {e}")
-            return False
+        return self.db_manager.insert_data(COLLECTION_NAME, data)
     
     def search_reid(self, query_matrix: List[float], limit: int = 10, 
                     filter_expr: Optional[str] = None) -> List[Dict]:
         """Search for similar vectors"""
-        try:
-            results = self.client.search(
-                collection_name=COLLECTION_NAME,
-                data=[query_matrix],
-                filter=filter_expr,
-                limit=limit,
-                output_fields=["detection_uuid", "source_id", "timestamp", "reid"]
-            )
-            
-            matches = []
-            for hits in results:
-                for hit in hits:
-                    matches.append({
-                        'detection_uuid': hit.get('entity', {}).get('detection_uuid') or hit.get('detection_uuid'),
-                        'source_id': hit.get('entity', {}).get('source_id') or hit.get('source_id'),
-                        'timestamp': hit.get('entity', {}).get('timestamp') or hit.get('timestamp'),
-                        'reid': hit.get('entity', {}).get('reid') or hit.get('reid'),
-                        'similarity': hit.get('distance', 0.0)
-                    })
-            
-            return matches
-        except Exception as e:
-            logger.error(f"❌ Search failed: {e}")
-            return []
+        return self.db_manager.search_vectors(
+            collection_name=COLLECTION_NAME,
+            query_vectors=[query_matrix],
+            filter_expr=filter_expr,
+            limit=limit,
+            output_fields=["detection_uuid", "source_id", "timestamp", "reid"]
+        )
 
 
 if __name__ == "__main__":

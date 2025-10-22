@@ -6,61 +6,21 @@ Stimulates a search to see what happens
 
 import time
 from docker_utils import DockerManager
+from database_utils import quick_search_test, quick_query_test
 
 def test_search():
     """
     Test a simple search operation
     """
-    try:
-        from pymilvus import MilvusClient
-        client = MilvusClient(uri="http://localhost:19530")
-        client.using_database("test_db")
-        
-        print("   🔍 Attempting search...")
-        search_results = client.search(
-            collection_name="test_collection",
-            data=[[0.1] * 2048],
-            limit=5
-        )
-        
-        if search_results and search_results[0]:
-            print(f"   ✅ Search successful: {len(search_results[0])} results")
-            return True
-        else:
-            print("   ❌ Search returned no results")
-            return False
-            
-    except Exception as e:
-        print(f"   ❌ Search failed: {e}")
-        return False
+    print("   🔍 Attempting search...")
+    return quick_search_test("test_collection")
 
 def test_query():
     """
     Test a simple query operation
     """
-    try:
-        from pymilvus import MilvusClient
-        client = MilvusClient(uri="http://localhost:19530")
-        client.using_database("test_db")
-        
-        print("   🔍 Attempting query...")
-        query_results = client.query(
-            collection_name="test_collection",
-            filter="",
-            output_fields=["id", "label"],
-            limit=10
-        )
-        
-        if query_results:
-            print(f"   ✅ Query successful: {len(query_results)} results")
-            return True
-        else:
-            print("   ❌ Query returned no results")
-            return False
-            
-    except Exception as e:
-        print(f"   ❌ Query failed: {e}")
-        return False
+    print("   🔍 Attempting query...")
+    return quick_query_test("test_collection")
 
 def main():
     """

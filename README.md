@@ -26,6 +26,9 @@ This project implements a distributed Milvus architecture with the following com
 - ✅ **Production Ready**: Optimized configuration for DetectionSuite workloads
 - ✅ **Web UI**: Attu interface for database management
 - ✅ **Health Checks**: All services include health monitoring
+- ✅ **Robust Timeout Handling**: Thread-safe timeout protection prevents hanging operations
+- ✅ **Data Integrity**: Prevents data collision and ensures proper test isolation
+- ✅ **Kafka Message Size Optimization**: Configured for large vector operations
 
 ## 🚀 Quick Start
 
@@ -79,6 +82,15 @@ python3 tests/test_replication.py
 
 # Run the bidirectional failover test
 python3 tests/bidirectional_test.py
+
+# Run all test suites
+python3 tests/test_runner.py
+
+# Run specific test suites
+python3 tests/test_runner.py --suites replication_test bidirectional_test
+
+# Run quick essential tests
+python3 tests/test_runner.py --quick
 ```
 
 ### Test Features
@@ -90,15 +102,50 @@ python3 tests/bidirectional_test.py
 - Replica factor verification
 - Automatic fallback to collection-level replicas
 
-#### Bidirectional Failover Test (`bidirectional_test.py`)
+#### Comprehensive Failover Test (`failover_test.py`)
 - **Comprehensive failover testing**: Tests system behavior with individual node failures
-- **Database cleanup and setup**: Automatically prepares test data (10 records)
+- **Database cleanup and setup**: Automatically prepares test data (20 records)
 - **Bidirectional testing**: Tests failover in both directions (querynode1 → querynode2)
 - **Search functionality verification**: Ensures search works with nodes down
 - **Expected failure validation**: Confirms system fails when both nodes are down
 - **Full recovery testing**: Verifies complete system recovery after restart
-- **Timeout protection**: Prevents hanging operations with configurable timeouts
+- **Thread-safe timeout protection**: Uses ThreadPoolExecutor for reliable timeout handling
+- **Data collision prevention**: Unique prefixes prevent data overwrites during testing
 - **Docker integration**: Uses Docker utilities for container management
+
+#### Performance Test (`performance_test.py`)
+- **Insert performance**: Tests concurrent insert operations (1000+ vectors/sec)
+- **Search performance**: Tests search latency under load
+- **Memory usage monitoring**: Tracks memory consumption during operations
+- **Concurrent operations**: Tests multi-threaded insert and search operations
+- **System metrics**: Monitors CPU, memory, disk, and network usage
+- **Resource utilization**: Validates system resource efficiency
+- **Optimized batch sizes**: Reduced batch size (20 records) to prevent Kafka message size errors
+- **Kafka message size handling**: Configured for large vector operations
+
+#### Chaos Engineering Test (`chaos_engineering_test.py`)
+- **Random container restarts**: Tests resilience during random failures
+- **Cascading failures**: Tests system behavior with multiple node failures
+- **Resource exhaustion**: Tests system under high memory/CPU usage
+- **Network partition**: Tests behavior during network connectivity issues
+- **Clock skew simulation**: Tests system with timestamp inconsistencies
+- **Failure recovery**: Validates automatic recovery mechanisms
+
+#### Consistency Test (`consistency_test.py`)
+- **Data integrity**: Verifies data integrity during insert and search operations
+- **Replica consistency**: Tests consistency across replica nodes
+- **Concurrent consistency**: Tests data consistency under concurrent operations
+- **Transaction atomicity**: Validates transaction rollback behavior
+- **Data loss detection**: Tests data loss detection and recovery
+- **Checksum verification**: Ensures data integrity with checksum validation
+
+#### Comprehensive Test Runner (`test_runner.py`)
+- **Unified test execution**: Runs all test suites with a single command
+- **Detailed reporting**: Generates comprehensive test reports
+- **Prerequisites checking**: Validates system readiness before testing
+- **Selective testing**: Allows running specific test suites
+- **Quick testing**: Essential tests for rapid validation
+- **Report generation**: Saves detailed test results to files
 
 ### Bidirectional Test Details
 
@@ -189,6 +236,12 @@ MINIO_SECRET_ACCESS_KEY=minioadmin
 QUERYNODE_MEMORY_LIMIT=8192  # 8GB
 DATANODE_MEMORY_LIMIT=4096   # 4GB
 
+# Kafka Message Size Limits (prevents "Message size too large" errors)
+KAFKA_MESSAGE_MAX_BYTES=10485760  # 10MB
+KAFKA_REPLICA_FETCH_MAX_BYTES=10485760  # 10MB
+KAFKA_SOCKET_SEND_BUFFER_BYTES=10485760  # 10MB
+KAFKA_SOCKET_RECEIVE_BUFFER_BYTES=10485760  # 10MB
+
 # Retention
 RETENTION_DURATION=168  # 7 days
 ```
@@ -239,6 +292,10 @@ kafka-mivlus-integration/
 ├── tests/
 │   ├── test_replication.py     # Replica testing
 │   ├── bidirectional_test.py   # Bidirectional failover testing
+│   ├── performance_test.py    # Performance and load testing
+│   ├── chaos_engineering_test.py  # Chaos engineering tests
+│   ├── consistency_test.py    # Data consistency testing
+│   ├── test_runner.py         # Comprehensive test runner
 │   └── docker_utils.py         # Docker container management utilities
 └── README.md                   # This file
 ```
@@ -288,16 +345,28 @@ docker-compose ps
 QUERYNODE_MEMORY_LIMIT=4096  # Reduce from 8192
 ```
 
-**Bidirectional test issues:**
+**"Message size too large" errors:**
 ```bash
-# Check container status before running test
-python3 tests/docker_utils.py
+# Restart containers after Kafka configuration changes
+docker-compose down
+docker-compose up -d
 
-# Ensure all containers are running
-docker-compose ps
+# Check Kafka message size limits in milvus-distributed.env
+# Default is 10MB, increase if needed for larger batches
+```
 
-# If test hangs, check for timeout issues
-# The test has 60-second timeout protection
+**Timeout issues in tests:**
+```bash
+# The failover test now uses ThreadPoolExecutor for reliable timeouts
+# If tests still hang, check Milvus client timeout configuration
+# Client timeout is set to 30 seconds in database_utils.py
+```
+
+**Data collision in tests:**
+```bash
+# Tests now use unique prefixes to prevent data overwrites
+# failover_test uses "failover_record_" and "failover_recovery_record_" prefixes
+# This ensures proper test isolation and data integrity
 ```
 
 ### Logs and Debugging
@@ -328,6 +397,30 @@ All data is persisted in Docker volumes:
 # Backup volumes
 docker run --rm -v kafka-mivlus-integration_minio_data:/data -v $(pwd):/backup alpine tar czf /backup/minio_backup.tar.gz -C /data .
 ```
+
+## 🔄 Recent Improvements
+
+### Version 2.1 Updates
+
+**Enhanced Timeout Handling:**
+- ✅ **Thread-safe timeouts**: Replaced signal-based timeouts with ThreadPoolExecutor
+- ✅ **Client-level timeouts**: Added 30-second timeout to Milvus client connections
+- ✅ **Reliable test execution**: Prevents hanging operations during failover testing
+
+**Data Integrity Improvements:**
+- ✅ **Collision prevention**: Unique prefixes prevent data overwrites during testing
+- ✅ **Test isolation**: Each test phase uses distinct data identifiers
+- ✅ **Proper verification**: Tests can accurately validate data persistence
+
+**Kafka Message Size Optimization:**
+- ✅ **Message size limits**: Configured 10MB limits to prevent "Message size too large" errors
+- ✅ **Optimized batch sizes**: Reduced performance test batch size from 100 to 20 records
+- ✅ **Large vector support**: Handles 2048-dimensional vectors without message size issues
+
+**Configuration Enhancements:**
+- ✅ **Kafka configuration**: Added comprehensive message size and buffer settings
+- ✅ **Client timeout**: Milvus client now has proper timeout configuration
+- ✅ **Performance tuning**: Optimized for large vector operations
 
 ## 📚 Additional Resources
 
